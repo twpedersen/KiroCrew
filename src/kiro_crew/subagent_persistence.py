@@ -385,6 +385,36 @@ def clear_tombstone(agent_id: str) -> bool:
         return False
 
 
+def clear_tombstone_for_recovery(agent_id: str) -> bool:
+    """Clear a tombstone and verify orphan recovery can see the agent.
+
+    ``clear_tombstone`` retains its best-effort compatibility contract, whose
+    false result cannot distinguish an already-absent marker from a failed
+    unlink. Recovery handoffs need the stronger postcondition: the marker must
+    be absent after the attempt. Filesystem inspection fails closed because an
+    unreadable marker is not evidence that restart reconciliation can admit it.
+    """
+
+    clear_tombstone(agent_id)
+    tombstone = _agent_dir(agent_id) / "tombstone.json"
+    try:
+        tombstone.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        logger.error(
+            "Cannot verify tombstone clearance for %s; recovery remains blocked",
+            agent_id,
+            exc_info=True,
+        )
+        return False
+    logger.error(
+        "Tombstone remains for %s after clearance; recovery remains blocked",
+        agent_id,
+    )
+    return False
+
+
 # ── slow-command record (stalled but STILL RUNNING) ──────────────────
 
 
@@ -497,8 +527,12 @@ def prune_stale_tombstones(max_age_days: int = 7, delivered_ttl_secs: int = 3600
                 # Best-effort session cleanup — must not block folder removal
                 try:
                     state = read_state(d.name)
-                    session_id = ts.get("session_id") or (state.get("session_id", "") if state else "")
-                    provider = ts.get("provider") or (state.get("provider", "acp") if state else "acp")
+                    session_id = ts.get("session_id") or (
+                        state.get("session_id", "") if state else ""
+                    )
+                    provider = ts.get("provider") or (
+                        state.get("provider", "acp") if state else "acp"
+                    )
                     cwd = ts.get("cwd") or (state.get("cwd", "") if state else "")
                     # keep=True conversations retain their session files as
                     # resume material for spawn_continue; the conversation
