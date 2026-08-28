@@ -464,8 +464,10 @@ def ensure_instance_boundary(
 ) -> str:
     """Create (once, idempotently) a shared instance permissions boundary; return its ARN.
 
-    Default ``name`` is :data:`iam.BOUNDARY_NAME` (the default launch path).
-    AgentCore launches pass :data:`iam.AGENTCORE_BOUNDARY_NAME`. Never
+    Default ``name`` is :data:`iam.BOUNDARY_NAME` (the launch CreateRole
+    path, including AgentCore-posture launches). The successor
+    :data:`iam.AGENTCORE_BOUNDARY_NAME` is administrator-pre-created
+    (``iam-boundary --agentcore``). Never
     ``CreatePolicyVersion`` — an existing boundary is left untouched and
     fail-closed if its content does not match the content-fixed document for
     that name.
