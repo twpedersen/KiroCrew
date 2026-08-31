@@ -27,10 +27,13 @@ from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     KiroCrewConfig,
     _workspace_name_for_dir,
     config_dir,
     default_project_dir,
+    published_autocompact_pct,
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
@@ -4634,6 +4637,125 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             _broadcast_context_reset(state, slot.key, None)
         state.push_slots_update()
         return web.json_response({"ok": True, "model": model_name})
+
+
+async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/autocompact — per-session compact threshold.
+
+    GET returns the slot's override (``pct``, null when it follows the global),
+    the current global (``global_pct``), and the valid range. POST takes
+    ``{"pct": <number|null>}``: a number sets this session's override (rejected
+    outside the documented range, matching the global knob's PATCH validation),
+    null clears it back to the global. The value applies to the live session
+    immediately via the SessionManager override map and persists with the slot
+    metadata, so it survives gateway restarts.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # Session-aware ownership gate, not the slot-only check: the POST writes the
+    # override keyed by effective_session_key(slot), so a linked app-owned slot
+    # (channel stem) would let an app modify a foreign session's threshold and
+    # metadata. _check_slot_app_ownership authorizes the key the write actually
+    # lands on, same as /context and /note.
+    request_app = request.get("app", "")
+    denied = _check_slot_app_ownership(slot, name, request_app, "slot_autocompact")
+    if denied is not None:
+        return denied
+    if request.method == "GET":
+        return web.json_response(
+            {
+                "pct": slot.autocompact_pct,
+                "global_pct": published_autocompact_pct(),
+                "min": AUTOCOMPACT_PCT_MIN,
+                "max": AUTOCOMPACT_PCT_MAX,
+            }
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_json"}, status=400
+        )
+    if "pct" not in body:
+        return web.json_response(
+            {"error": "pct is required (number or null)", "code": "pct_required"}, status=400
+        )
+    pct = body["pct"]
+    if pct is not None:
+        # bool is an int subclass; True would otherwise read as 1.0 and be
+        # rejected by range, but reject it explicitly for a clear error.
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return web.json_response(
+                {"error": "pct must be a number or null", "code": "pct_not_a_number"}, status=400
+            )
+        try:
+            pct = float(pct)
+        except OverflowError:
+            # An int too large for a float; out of range by definition.
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if pct != pct:  # NaN
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if not (AUTOCOMPACT_PCT_MIN <= pct <= AUTOCOMPACT_PCT_MAX):
+            return web.json_response(
+                {
+                    "error": (
+                        f"pct must be between {AUTOCOMPACT_PCT_MIN:g} "
+                        f"and {AUTOCOMPACT_PCT_MAX:g}"
+                    ),
+                    "code": "pct_out_of_range",
+                },
+                status=400,
+            )
+    # Same window as /context: authorized before the body read, so re-decide
+    # against the slot as it is now, ahead of the first write.
+    stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+    if stale is not None:
+        return stale
+    # Persist FIRST, mutate after: if the metadata write raises, the live
+    # threshold and the slot field must be left untouched, or the client gets
+    # a 500 while the server silently runs on the new value until restart
+    # reverts it. The dirty flush early-outs on an empty message window, so a
+    # message-less slot's override would never reach disk via _dirty alone --
+    # write the metadata directly, the off-loop pattern
+    # update_metadata_off_loop documents for async handlers.
+    if state.conversation_log:
+        try:
+            await asyncio.to_thread(
+                state.conversation_log.update_metadata,
+                slot_history_key(slot),
+                {"autocompact_pct": pct},
+            )
+        except Exception:
+            logger.exception("Slot %s autocompact_pct persist failed", name)
+            return web.json_response(
+                {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+            )
+        # INVARIANT for this handler: every write is immediately preceded by an
+        # authorization decision with NO await between them. The persist await
+        # above is itself a rebind window (same mechanism as the body read), so
+        # re-decide again before the live mutations. The persisted metadata is
+        # keyed by the pre-await transcript key and is inert for a rebound slot:
+        # its restore path re-validates, and a denied caller gets the same 404.
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+        if stale is not None:
+            return stale
+    slot.autocompact_pct = pct
+    # Apply live: the compaction gate reads the SessionManager override map,
+    # so the new threshold binds on the very next context reading.
+    state.sessions.set_autocompact_pct(effective_session_key(slot), pct)
+    logger.info("Slot %s autocompact_pct set to %r", name, pct)
+    # Keep the slot metadata flush in sync too (no-op for empty slots).
+    slot._dirty = True
+    return web.json_response({"ok": True, "pct": pct, "global_pct": published_autocompact_pct()})
 
 
 async def api_chat_slots_model(request: web.Request) -> web.Response:

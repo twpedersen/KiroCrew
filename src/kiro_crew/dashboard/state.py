@@ -2927,6 +2927,7 @@ class _ChatSlot:
         "agent",
         "model",
         "reasoning_effort",
+        "autocompact_pct",
         "mode",
         "workspace",
         "project",
@@ -3088,6 +3089,10 @@ class _ChatSlot:
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
+        # Per-session auto-compact threshold override (percent). None = follow
+        # the global session.autocompact_pct. Persisted with the slot and
+        # re-seeded into the SessionManager after restore.
+        self.autocompact_pct: float | None = None
         # "" = default chat, "orchestrator" = orchestrated chat
         self.mode = mode
         self.workspace = workspace
