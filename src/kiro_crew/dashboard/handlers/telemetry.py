@@ -53,7 +53,7 @@ from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.hooks import validate_file_path
 from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin, otlp_egress_active
 from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
-from kiro_crew.metrics.turns import TURN_METRIC
+from kiro_crew.metrics.turns import TURN_COST_METRIC, TURN_CREDITS_METRIC, TURN_METRIC
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,13 @@ _STARTUP_METRIC = "kirocrew.session.startup.duration"
 # Read from the emitter's own constant rather than re-spelled: a reader and an
 # emitter naming the instrument differently is a silently empty panel.
 _TURN_METRIC = TURN_METRIC
+# The turn's two billing histograms. Claimed BY NAME below, ahead of the generic
+# histogram branch, because that branch reports every statistic under `*_ms`
+# keys: a credit or a dollar amount arriving there would be rendered as a
+# millisecond duration on the Telemetry page. They are reported inside the turn
+# block under unit-neutral keys instead, each carrying its own `unit`.
+_TURN_CREDITS_METRIC = TURN_CREDITS_METRIC
+_TURN_COST_METRIC = TURN_COST_METRIC
 # The end-to-end startup point. The claude path emits no ``phase`` attribute at
 # all, so an absent phase is treated as the total (see _aggregate).
 _PHASE_TOTAL = "total"
@@ -101,9 +108,15 @@ _OTHER_SPLIT_ATTRS = frozenset({"warm"})
 # and fault_rate stays a single-series computation.
 # Every entry here must have a producer: either a turn_outcome return label
 # or "unknown" (minted by this aggregator for attribute-less points) — the
-# cross-module test enforces that, so a dead entry (e.g. a "cancelled" label
-# nothing ever emitted — user cancels map to "error") cannot linger and
-# mislead readers about what fault_rate counts.
+# cross-module test enforces that, so a dead entry cannot linger and mislead
+# readers about what fault_rate counts.
+# "cancelled" is deliberately ABSENT, and its absence is a FIX rather than an
+# omission: a user cancel used to fold into "error", so every press of Stop
+# landed in this numerator and the one outcome the operator caused on purpose
+# was reported as the system failing. It now has its own label and stays out of
+# the numerator, while remaining in the DENOMINATOR alongside "ok" and the
+# recovered stalls — a cancelled turn did run, so removing it would shrink the
+# population fault_rate is a share of.
 # "unclassified" is deliberately ABSENT: it marks a turn whose surface had no
 # stop reason to give (a bare TurnUsage at a helper call site), so counting it
 # would invent a fault for every clean background turn the moment this metric
@@ -674,6 +687,43 @@ def _daily_series(daily: dict[str, dict[str, _Hist]]) -> list[dict[str, Any]]:
     return out
 
 
+def _amount_stats(hist: "_Hist", unit: str) -> dict[str, Any]:
+    """Percentiles for a NON-duration histogram, under unit-neutral keys.
+
+    ``_Hist.stats()`` names every field ``*_ms`` and rounds to one decimal, both
+    of which are correct for the duration family and wrong for an amount: a
+    dollar figure reported as ``p50_ms`` is a unit lie the frontend then formats
+    with a millisecond suffix, and one-decimal rounding turns a sub-cent turn
+    into ``0.0``. So the keys drop the suffix, the ``unit`` travels WITH the
+    numbers instead of being implied by them, and rounding keeps six decimals —
+    enough for a fraction of a cent to survive.
+
+    Deliberately NOT a second signature on ``stats()``: the duration surfaces
+    read ``p50_ms`` from a dozen places, and making that key conditional would
+    make every one of them depend on a unit argument they have no reason to know
+    about.
+    """
+    g = hist._dominant()
+    if g is None:
+        return {"count": 0, "unit": unit}
+    cnt = int(g["count"])
+    return {
+        "count": cnt,
+        "unit": unit,
+        "total": round(float(g["sum"]), 6),
+        "mean": round(float(g["sum"]) / cnt, 6) if cnt else 0.0,
+        "p50": round(_pct_from_buckets(g["buckets"], g["bounds"], 0.50), 6),
+        "p90": round(_pct_from_buckets(g["buckets"], g["bounds"], 0.90), 6),
+        "min": round(g["min"], 6) if g["min"] is not None else 0.0,
+        "max": round(g["max"], 6) if g["max"] is not None else 0.0,
+        # Same disclosure the duration surfaces make: >0 means the window
+        # straddles a bucket-boundary change and only the dominant generation is
+        # reported here, with total_count the full population.
+        "other_generations": hist.other_generations,
+        "total_count": hist.total_count,
+    }
+
+
 def _other_series(
     other_hist: dict[str, _Hist],
     other_split: dict[str, dict[str, _Hist]],
@@ -870,6 +920,13 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     # stream.
     other_cum: dict[str, dict[tuple[str, str, str], list[tuple[int, float]]]] = {}
     turn = _Hist()
+    # The turn's billed amount, kept OUT of other_hist so it is never reported
+    # under `*_ms` keys. Exactly one of the two is populated on a given host —
+    # the acp backend bills credits, claude_code bills dollars — so the other
+    # reports an empty stat block, which reads as "this host does not bill here"
+    # rather than as a measured zero.
+    turn_credits = _Hist()
+    turn_cost = _Hist()
 
     for name, dp, shard_day, shard_pid, identity, data in _iter_metric_points(shard_paths):
         attrs = dp.get("attributes") or {}
@@ -901,6 +958,10 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
             db["cold" if spawned else "warm"].add(dp)
         elif name == _TURN_METRIC and is_hist:
             turn.add(dp, outcome=str(attrs.get("outcome", "unknown")))
+        elif name == _TURN_CREDITS_METRIC and is_hist:
+            turn_credits.add(dp)
+        elif name == _TURN_COST_METRIC and is_hist:
+            turn_cost.add(dp)
         elif is_hist:
             other_hist.setdefault(name, _Hist()).add(dp)
             for ak in _OTHER_SPLIT_ATTRS:
@@ -988,6 +1049,10 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
         **turn.stats(),
         "outcome": turn_outcome,
         "fault_rate": round(turn_faults / turn_classified, 4) if turn_classified else 0.0,
+        # What the turn COST, beside how long it took, so spend per turn is read
+        # against latency over the same population rather than joined by hand.
+        "credits": _amount_stats(turn_credits, "credit"),
+        "cost_usd": _amount_stats(turn_cost, "usd"),
     }
 
     return {
