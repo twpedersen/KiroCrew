@@ -53,6 +53,7 @@ from kiro_crew.acp.liveness import (
     _consume_future_exception,
     consult_offloaded,
 )
+from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -2216,6 +2217,11 @@ class AcpClient:
         self._next_id = 1
         self._buffer: deque[JsonRpcMessage] = deque(maxlen=100)
         self._mcp_notifications: list[JsonRpcMessage] = []
+        # What THIS session's MCP servers reported at init. The frames arrive
+        # during _drain_notifications and were previously reduced to one log
+        # line and dropped, so a session that started without a server had no
+        # way to say so. Read via mcp_session_report().
+        self._mcp_report = McpSessionReport()
         # MCP OAuth requests collected during session init from
         # `_kiro.dev/mcp/oauth_request` notifications. Drained by callers via
         # `pop_pending_oauth_requests()` after `ensure_ready()` so the UI can
@@ -3390,6 +3396,11 @@ class AcpClient:
         self._last_stop_reason = ""
         self._pending_oauth_requests.clear()
         self._oauth_emitted_servers.clear()
+        # A retired session's report must not be read as the next one's. This
+        # view exists to be evidence, and stale evidence is worse than none:
+        # the replacement process re-initializes its servers from scratch and
+        # will report again.
+        self._mcp_report = McpSessionReport()
         # Untrack PIDs from the orphan tracking files — but ONLY those confirmed
         # dead. A child or root still alive after teardown survived the kill
         # (killpg only reaches the kiro-cli process group, so children in other
@@ -3479,6 +3490,11 @@ class AcpClient:
         }
         if self._is_claude:
             new_params["_meta"] = {"claudeCode": {"options": {}}}
+
+        # The roster this session put ON THE WIRE. Distinct from the agent spec
+        # on disk: the backend starts the spec's own servers too, so the frames
+        # that come back are a superset of this list.
+        self._mcp_report.begin_session(new_params.get("mcpServers"))
 
         self._last_substitution_model = None
         session_id = await self._send_request(METHOD_SESSION_NEW, new_params)
@@ -3602,6 +3618,7 @@ class AcpClient:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
                     else:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
+                    self._mcp_report.begin_session(load_params.get("mcpServers"))
                     load_id = await self._send_request(METHOD_SESSION_LOAD, load_params)
                     load_resp = await self._wait_for_response(
                         load_id,
@@ -4183,6 +4200,7 @@ class AcpClient:
             drained += 1
             _capture_oauth(msg)
             _capture_config_update(msg)
+            self._mcp_report.record_frame(msg)
             name = ""
             if isinstance(msg.params, dict):
                 name = msg.params.get("name") or msg.params.get("serverName") or ""
@@ -4214,6 +4232,7 @@ class AcpClient:
                 drained += 1
                 _capture_oauth(read_msg)
                 _capture_config_update(read_msg)
+                self._mcp_report.record_frame(read_msg)
                 if "mcp" in (read_msg.method or ""):
                     name = ""
                     if isinstance(read_msg.params, dict):
@@ -4236,6 +4255,17 @@ class AcpClient:
         out = list(self._pending_oauth_requests)
         self._pending_oauth_requests.clear()
         return out
+
+    def mcp_session_report(self) -> McpSessionReport:
+        """This session's MCP registration report (see ``mcp_session_report``).
+
+        Unlike :meth:`pop_pending_oauth_requests` this does NOT drain: the report
+        is the session's standing answer to "which servers actually started
+        here", read repeatedly and still true. Callers must render an unreported
+        server as *not reported*, never as *not mounted* — the drain is time
+        bounded and a late frame still arrives mid-turn.
+        """
+        return self._mcp_report
 
     # ── Prompt Loop Helpers ──
 
