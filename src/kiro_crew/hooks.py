@@ -137,19 +137,54 @@ class ToolHookResult:
     #: and deny-by-default-shell messages do not), so matching on it would
     #: classify a sensitive-path or exfiltration deny as non-security.
     security_deny: bool = True
+    #: True only for a result built by one of the four factories below, which is
+    #: how the permission GATE states its verdict. A surface that overrides that
+    #: verdict builds a result directly instead (``chat_runner`` downgrades an
+    #: auto-approve to an interactive card this way, twice), and those must not be
+    #: counted: the gate was consulted once, so counting every constructed object
+    #: would report one request as two decisions AND keep a count for a verdict
+    #: that was then discarded.
+    from_gate: bool = False
+
+    def __post_init__(self) -> None:
+        """Count the gate's verdict. Best-effort; never changes the decision.
+
+        Fires once per gate consultation -- every exit of
+        ``HookManager.on_tool_call`` returns through a factory, and nothing else
+        sets :attr:`from_gate`. Instrumenting the method's 23 exits directly, or
+        counting every construction, were the two alternatives: the first is 23
+        call sites on a security path, the second double-counts.
+
+        ``action`` is one of three module constants and ``security_deny`` a bool,
+        so the series is bounded by construction -- no reason string, tool name or
+        command reaches the recorder.
+        """
+        if not self.from_gate:
+            return
+        try:
+            from kiro_crew.metrics.events import APPROVAL_DECISIONS, emit_counter
+
+            emit_counter(
+                APPROVAL_DECISIONS,
+                {"decision": self.action, "security_deny": bool(self.security_deny)},
+            )
+        except Exception:  # a tool decision must never fail on its telemetry
+            logger.debug("approval decision counter failed", exc_info=True)
 
     @staticmethod
     def allow() -> ToolHookResult:
-        return ToolHookResult(action=TOOL_ALLOW)
+        return ToolHookResult(action=TOOL_ALLOW, from_gate=True)
 
     @staticmethod
     def auto_approve() -> ToolHookResult:
-        return ToolHookResult(action=TOOL_AUTO_APPROVE)
+        return ToolHookResult(action=TOOL_AUTO_APPROVE, from_gate=True)
 
     @staticmethod
     def deny(reason: str) -> ToolHookResult:
         """Deny on a hard security check — the attempt is the problem."""
-        return ToolHookResult(action=TOOL_DENY, reason=reason, security_deny=True)
+        return ToolHookResult(
+            action=TOOL_DENY, reason=reason, security_deny=True, from_gate=True
+        )
 
     @staticmethod
     def deny_policy(reason: str) -> ToolHookResult:
@@ -159,7 +194,9 @@ class ToolHookResult:
         durable budget (cron auto-pause) does not treat a governance ceiling as
         a defect in what it attempted.
         """
-        return ToolHookResult(action=TOOL_DENY, reason=reason, security_deny=False)
+        return ToolHookResult(
+            action=TOOL_DENY, reason=reason, security_deny=False, from_gate=True
+        )
 
 
 # ── Config Types ──

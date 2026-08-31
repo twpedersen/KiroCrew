@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator, Callable, Mapping, MutableMapping, Se
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.metrics.sessions import record_session_started
+
 if TYPE_CHECKING:
     from kiro_crew.acp.types import AcpEvent
     from kiro_crew.providers.base import LLMProvider
@@ -256,6 +258,7 @@ class BackgroundSessionRuntime:
                     agent=background_agent,
                 )
                 self._owner._sessions[background_key] = sess
+                record_session_started(background_key)
                 logger.info("Background session created")
                 return
         # Racing registration lost, or shutdown began while we were starting:

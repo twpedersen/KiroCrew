@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from kiro_crew.metrics.sessions import record_session_started
+
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
@@ -565,6 +567,7 @@ class SessionAllocationService:
                 )
                 self._sessions[key] = session
                 won_race_session = session
+                record_session_started(key)
         if duplicate is not None:
             try:
                 await duplicate.shutdown()
@@ -1347,6 +1350,7 @@ class SessionAllocationService:
                     ):
                         owner._session_map.clear_sid(key)
                     self._sessions[key] = session
+                    record_session_started(key)
                     self._deps.logger.info(
                         "New session: %s agent=%s resumed=%s provider_switch=%s (total=%d)",
                         key,
