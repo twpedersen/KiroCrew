@@ -2252,6 +2252,52 @@ class TestApplyTrustFields:
         assert out["provenance"] == "external"
         assert out["verified"] is False
 
+    def test_stargazers_count_valid_int_survives_on_external_row(self):
+        """A self-reported display-only star count is acceptable — pass it
+        through sanitized rather than stripping it."""
+        entry = {"name": "ext-app", "_registry": "labs", "stargazersCount": 1234}
+        (out,) = registry._apply_trust_fields([entry])
+        assert out["stargazersCount"] == 1234
+
+    def test_stargazers_count_zero_survives(self):
+        entry = {"name": "ext-app", "_registry": "labs", "stargazersCount": 0}
+        (out,) = registry._apply_trust_fields([entry])
+        assert out["stargazersCount"] == 0
+
+    @pytest.mark.parametrize(
+        "bad",
+        [-1, "1234", True, False, 3.5, None, [12], {"n": 12}, 9_007_199_254_740_992],
+        ids=["negative", "string", "true", "false", "float", "none", "list", "dict", "over-js-max"],
+    )
+    def test_stargazers_count_non_int_values_are_dropped(self, bad):
+        """This is the only boundary EVERY row crosses (``_resolve_manifest``
+        passes the row through unchanged on a failed manifest fetch, so the
+        allowlist projection is not a guaranteed exit) — a malformed count is
+        dropped here, never coerced. The upper bound is the JS safe-integer
+        range: Python accepts a 309-digit int that JavaScript renders as
+        hundreds of digits."""
+        entry = {"name": "ext-app", "_registry": "labs", "stargazersCount": bad}
+        (out,) = registry._apply_trust_fields([entry])
+        assert "stargazersCount" not in out
+
+    def test_stargazers_count_at_the_js_safe_integer_bound_survives(self):
+        entry = {"name": "ext-app", "_registry": "labs", "stargazersCount": 9_007_199_254_740_991}
+        (out,) = registry._apply_trust_fields([entry])
+        assert out["stargazersCount"] == 9_007_199_254_740_991
+
+    def test_stargazers_count_sanitized_on_non_external_rows_too(self):
+        """Sanitization applies to every row, not just the external branch."""
+        entry = {"name": "seed-app", "stargazersCount": "9999"}
+        (out,) = registry._apply_trust_fields([entry])
+        assert "stargazersCount" not in out
+
+    def test_builtin_row_without_stargazers_count_is_unaffected(self):
+        entry = {"name": "demo", "origin": "builtin"}
+        (out,) = registry._apply_trust_fields([entry])
+        assert "stargazersCount" not in out
+        assert out["provenance"] == "builtin"
+        assert out["verified"] is True
+
     def test_clone_target_is_server_overwritten_and_prefers_git_url(self):
         """The modal must show what install will clone, not the legacy alias.
 
@@ -3280,6 +3326,7 @@ class TestMergeManifestProjectsRegistryKeys:
             ("detectInstalled", "which demo"),
             ("managed", True),
             ("featured", 2),
+            ("stargazersCount", 42),
             ("_registry", "labs"),
         ],
     )

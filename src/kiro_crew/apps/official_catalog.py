@@ -328,6 +328,33 @@ def _curated_tags(value: Any) -> list[str]:
     return [t for t in value if isinstance(t, str)]
 
 
+#: The largest integer JavaScript can represent exactly (2**53 - 1). A star
+#: count above this is not a plausible count, and forwarding one lets a
+#: hostile document render hundreds of digits into the store's layout.
+_STARS_MAX = 9_007_199_254_740_991
+
+
+def _curated_stars(entry: dict[str, Any]) -> int | None:
+    """The entry's baked ``stargazersCount``, or ``None`` when absent/invalid.
+
+    The publisher generates this field for git-source entries only, so a
+    non-git entry never yields one here regardless of what the document says.
+    ``bool`` is excluded explicitly (it subclasses ``int``), and the value is
+    bounded to the JS safe-integer range: the document arrived over the
+    network, so its types and magnitudes are as untrusted as its content.
+    Absence means "unknown", never zero.
+    """
+    source = entry.get("source")
+    if not isinstance(source, dict) or source.get("type") != "git":
+        return None
+    stars = entry.get("stargazersCount")
+    if isinstance(stars, bool) or not isinstance(stars, int):
+        return None
+    if stars < 0 or stars > _STARS_MAX:
+        return None
+    return stars
+
+
 #: A git object name as the published document must spell it: sha1 (40 hex) or
 #: sha256 (64 hex). Defined here rather than imported from ``registry`` because
 #: that module imports THIS one; the duplication is one regex against a circular
@@ -484,6 +511,8 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if (stars := _curated_stars(entry)) is not None:
+            row["stargazersCount"] = stars
         seen.add(name)
         rows.append(row)
     return rows
@@ -667,6 +696,8 @@ def annotate(rows: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if (stars := _curated_stars(entry)) is not None:
+            row["stargazersCount"] = stars
 
 
 def list_catalog_rows() -> list[dict[str, Any]]:
@@ -718,5 +749,7 @@ def list_catalog_rows() -> list[dict[str, Any]]:
             stype = _curated_str(source.get("type"))
             if stype in ("builtin", "git"):
                 row["source"] = {"type": stype}
+        if (stars := _curated_stars(entry)) is not None:
+            row["stargazersCount"] = stars
         rows.append(row)
     return rows
