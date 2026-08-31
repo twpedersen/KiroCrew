@@ -41,7 +41,7 @@ is Autopilot") so the model recognizes user references to *autopilot* /
 | `session_workspace.py` | `~/.kiro/crew/sessions/<id>/` layout for sub-agent result files |
 | `conductor_skill.py` | Always-on delegation skill (`agent.conductor_skill`, default `false`); independent of Autopilot |
 | `website/src/pages/chat/AssistantMessage.tsx` | `parseOptions` turns `[OPTION: …]` into buttons and sets `isPlan` |
-| `website/src/pages/ChatPage.tsx` | Routes a plan-option click to `api.planAction()` |
+| `website/src/pages/chat/useChatPageActionsController.ts` | Routes a plan-option click to `api.planAction()` |
 
 ## Slot State
 
@@ -133,8 +133,8 @@ appears to skip the gate entirely.
 from the displayed text so a stray earlier marker cannot leak as raw syntax, and
 sets `isPlan` when both a plan header and a stage marker are present. A click on
 a plan option in an orchestrator slot goes straight to
-`api.planAction(slot, action)` (`ChatPage.tsx:5097`) instead of filling the input
-box.
+`api.planAction(slot, action)` (`useChatPageActionsController.ts`) instead of
+filling the input box.
 
 ## Stage Gates
 
