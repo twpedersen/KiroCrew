@@ -15,6 +15,7 @@ from windows_sim import builtin_open_sharing_violation
 from kiro_crew import history
 from kiro_crew.history import (
     _CONSOLIDATION_THRESHOLD,
+    _METADATA_CACHE_MAX,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
     ConversationLog,
@@ -3983,12 +3984,32 @@ class TestConversationLogCacheBounded:
         assert len(log._msg_cache) <= 4
 
     def test_meta_cache_evicts_beyond_bound(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path, cache_max=3)
+        # Bounds the metadata cache through its OWN knob: it deliberately does not
+        # follow ``cache_max`` down (that constant is sized for transcript windows,
+        # and ``list_sessions`` scans the corpus cyclically, so an LRU smaller than
+        # the corpus never hits). The eviction invariant itself is unchanged.
+        log = ConversationLog(base_dir=tmp_path, meta_cache_max=3)
         for i in range(10):
             key = f"sess{i}"
             log.append(key, "user", f"hi {i}")
             log.get_metadata(key)  # populate meta cache
         assert len(log._meta_cache) <= 3
+
+    def test_a_small_cache_max_cannot_shrink_the_metadata_cache(self, tmp_path):
+        """``cache_max`` must not drag the metadata cache down with it.
+
+        ``list_sessions`` reads ``_meta_cache`` in one cyclic pass over the whole
+        session directory, so a bound below the corpus size is evicted in exactly
+        the order it will next be read and the hit rate collapses to ~0 — every
+        call re-opens and re-parses the first line of most of the store. The
+        transcript cache still honors the knob.
+        """
+        log = ConversationLog(base_dir=tmp_path, cache_max=8)
+        assert log._msg_cache._maxsize == 8, "the transcript cache still honors cache_max"
+        assert log._meta_cache._maxsize == _METADATA_CACHE_MAX, (
+            "the metadata cache followed cache_max down; list_sessions will thrash "
+            "on any store larger than that knob"
+        )
 
     def test_cache_hit_returns_same_object(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path, cache_max=8)
